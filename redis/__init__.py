@@ -1,20 +1,31 @@
-# legacy imports
-from redis.client import Redis, ConnectionPool
+from redis.client import Redis, StrictRedis
+from redis.connection import (
+    BlockingConnectionPool,
+    ConnectionPool,
+    Connection,
+    UnixDomainSocketConnection
+)
+from redis.utils import from_url
 from redis.exceptions import (
     AuthenticationError,
     ConnectionError,
+    BusyLoadingError,
     DataError,
     InvalidResponse,
     PubSubError,
     RedisError,
     ResponseError,
-    )
+    WatchError,
+)
 
 
-__version__ = '2.2.4'
+__version__ = '2.8.0'
+VERSION = tuple(map(int, __version__.split('.')))
 
 __all__ = [
-    'Redis', 'ConnectionPool',
+    'Redis', 'StrictRedis', 'ConnectionPool', 'BlockingConnectionPool',
+    'Connection', 'UnixDomainSocketConnection',
     'RedisError', 'ConnectionError', 'ResponseError', 'AuthenticationError',
-    'InvalidResponse', 'DataError', 'PubSubError',
-    ]
+    'InvalidResponse', 'DataError', 'PubSubError', 'WatchError', 'from_url',
+    'BusyLoadingError'
+]
