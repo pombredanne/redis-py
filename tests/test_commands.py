@@ -11,8 +11,27 @@ from redis.client import parse_info
 from redis import exceptions
 
 from .conftest import skip_if_server_version_lt
-# won't need this after next version of pytest
-from distutils.version import StrictVersion
+
+
+@pytest.fixture()
+def slowlog(request, r):
+    current_config = r.config_get()
+    old_slower_than_value = current_config['slowlog-log-slower-than']
+    old_max_legnth_value = current_config['slowlog-max-len']
+
+    def cleanup():
+        r.config_set('slowlog-log-slower-than', old_slower_than_value)
+        r.config_set('slowlog-max-len', old_max_legnth_value)
+    request.addfinalizer(cleanup)
+
+    r.config_set('slowlog-log-slower-than', 0)
+    r.config_set('slowlog-max-len', 128)
+
+
+def redis_server_time(client):
+    seconds, milliseconds = client.time()
+    timestamp = float('%s.%s' % (seconds, milliseconds))
+    return datetime.datetime.fromtimestamp(timestamp)
 
 
 # RESPONSE CALLBACKS
@@ -34,7 +53,7 @@ class TestRedisCommands(object):
         with pytest.raises(redis.ResponseError):
             r['a']
 
-    ### SERVER INFORMATION ###
+    # SERVER INFORMATION
     def test_client_list(self, r):
         clients = r.client_list()
         assert isinstance(clients[0], dict)
@@ -56,9 +75,11 @@ class TestRedisCommands(object):
 
     def test_config_resetstat(self, r):
         r.ping()
-        assert int(r.info()['total_commands_processed']) > 1
+        prior_commands_processed = int(r.info()['total_commands_processed'])
+        assert prior_commands_processed >= 1
         r.config_resetstat()
-        assert int(r.info()['total_commands_processed']) == 1
+        reset_commands_processed = int(r.info()['total_commands_processed'])
+        assert reset_commands_processed < prior_commands_processed
 
     def test_config_set(self, r):
         data = r.config_get()
@@ -73,13 +94,6 @@ class TestRedisCommands(object):
         r['a'] = 'foo'
         r['b'] = 'bar'
         assert r.dbsize() == 2
-
-    def test_debug_object(self, r):
-        r['a'] = 'foo'
-        debug_info = r.debug_object('a')
-        assert len(debug_info) > 0
-        assert 'refcount' in debug_info
-        assert debug_info['refcount'] == 1
 
     def test_echo(self, r):
         assert r.echo('foo bar') == b('foo bar')
@@ -98,10 +112,46 @@ class TestRedisCommands(object):
         r['a'] = 'foo'
         assert isinstance(r.object('refcount', 'a'), int)
         assert isinstance(r.object('idletime', 'a'), int)
-        assert r.object('encoding', 'a') == b('raw')
+        assert r.object('encoding', 'a') in (b('raw'), b('embstr'))
+        assert r.object('idletime', 'invalid-key') is None
 
     def test_ping(self, r):
         assert r.ping()
+
+    def test_slowlog_get(self, r, slowlog):
+        assert r.slowlog_reset()
+        unicode_string = unichr(3456) + u('abcd') + unichr(3421)
+        r.get(unicode_string)
+        slowlog = r.slowlog_get()
+        assert isinstance(slowlog, list)
+        commands = [log['command'] for log in slowlog]
+
+        get_command = b(' ').join((b('GET'), unicode_string.encode('utf-8')))
+        assert get_command in commands
+        assert b('SLOWLOG RESET') in commands
+        # the order should be ['GET <uni string>', 'SLOWLOG RESET'],
+        # but if other clients are executing commands at the same time, there
+        # could be commands, before, between, or after, so just check that
+        # the two we care about are in the appropriate order.
+        assert commands.index(get_command) < commands.index(b('SLOWLOG RESET'))
+
+        # make sure other attributes are typed correctly
+        assert isinstance(slowlog[0]['start_time'], int)
+        assert isinstance(slowlog[0]['duration'], int)
+
+    def test_slowlog_get_limit(self, r, slowlog):
+        assert r.slowlog_reset()
+        r.get('foo')
+        r.get('bar')
+        slowlog = r.slowlog_get(1)
+        assert isinstance(slowlog, list)
+        commands = [log['command'] for log in slowlog]
+        assert b('GET foo') not in commands
+        assert b('GET bar') in commands
+
+    def test_slowlog_length(self, r, slowlog):
+        r.get('foo')
+        assert isinstance(r.slowlog_len(), int)
 
     @skip_if_server_version_lt('2.6.0')
     def test_time(self, r):
@@ -110,7 +160,7 @@ class TestRedisCommands(object):
         assert isinstance(t[0], int)
         assert isinstance(t[1], int)
 
-    ### BASIC KEY COMMANDS ###
+    # BASIC KEY COMMANDS
     def test_append(self, r):
         assert r.append('a', 'a1') == 2
         assert r['a'] == b('a1')
@@ -180,6 +230,28 @@ class TestRedisCommands(object):
         assert int(binascii.hexlify(r['res2']), 16) == 0x0102FFFF
         assert int(binascii.hexlify(r['res3']), 16) == 0x000000FF
 
+    @skip_if_server_version_lt('2.8.7')
+    def test_bitpos(self, r):
+        key = 'key:bitpos'
+        r.set(key, b('\xff\xf0\x00'))
+        assert r.bitpos(key, 0) == 12
+        assert r.bitpos(key, 0, 2, -1) == 16
+        assert r.bitpos(key, 0, -2, -1) == 12
+        r.set(key, b('\x00\xff\xf0'))
+        assert r.bitpos(key, 1, 0) == 8
+        assert r.bitpos(key, 1, 1) == 8
+        r.set(key, b('\x00\x00\x00'))
+        assert r.bitpos(key, 1) == -1
+
+    @skip_if_server_version_lt('2.8.7')
+    def test_bitpos_wrong_arguments(self, r):
+        key = 'key:bitpos:wrong:args'
+        r.set(key, b('\xff\xf0\x00'))
+        with pytest.raises(exceptions.RedisError):
+            r.bitpos(key, 0, end=1) == 12
+        with pytest.raises(exceptions.RedisError):
+            r.bitpos(key, 7) == 12
+
     def test_decr(self, r):
         assert r.decr('a') == -1
         assert r['a'] == b('-1')
@@ -232,21 +304,21 @@ class TestRedisCommands(object):
         assert not r.ttl('a')
 
     def test_expireat_datetime(self, r):
-        expire_at = datetime.datetime.now() + datetime.timedelta(minutes=1)
+        expire_at = redis_server_time(r) + datetime.timedelta(minutes=1)
         r['a'] = 'foo'
         assert r.expireat('a', expire_at)
-        assert 0 < r.ttl('a') <= 60
+        assert 0 < r.ttl('a') <= 61
 
     def test_expireat_no_key(self, r):
-        expire_at = datetime.datetime.now() + datetime.timedelta(minutes=1)
+        expire_at = redis_server_time(r) + datetime.timedelta(minutes=1)
         assert not r.expireat('a', expire_at)
 
     def test_expireat_unixtime(self, r):
-        expire_at = datetime.datetime.now() + datetime.timedelta(minutes=1)
+        expire_at = redis_server_time(r) + datetime.timedelta(minutes=1)
         r['a'] = 'foo'
         expire_at_seconds = int(time.mktime(expire_at.timetuple()))
         assert r.expireat('a', expire_at_seconds)
-        assert 0 < r.ttl('a') <= 60
+        assert 0 < r.ttl('a') <= 61
 
     def test_get_and_set(self, r):
         # get and set can't be tested independently of each other
@@ -294,6 +366,7 @@ class TestRedisCommands(object):
     def test_getset(self, r):
         assert r.getset('a', 'foo') is None
         assert r.getset('a', 'bar') == b('foo')
+        assert r.get('a') == b('bar')
 
     def test_incr(self, r):
         assert r.incr('a') == 1
@@ -372,23 +445,23 @@ class TestRedisCommands(object):
 
     @skip_if_server_version_lt('2.6.0')
     def test_pexpireat_datetime(self, r):
-        expire_at = datetime.datetime.now() + datetime.timedelta(minutes=1)
+        expire_at = redis_server_time(r) + datetime.timedelta(minutes=1)
         r['a'] = 'foo'
         assert r.pexpireat('a', expire_at)
-        assert 0 < r.pttl('a') <= 60000
+        assert 0 < r.pttl('a') <= 61000
 
     @skip_if_server_version_lt('2.6.0')
     def test_pexpireat_no_key(self, r):
-        expire_at = datetime.datetime.now() + datetime.timedelta(minutes=1)
+        expire_at = redis_server_time(r) + datetime.timedelta(minutes=1)
         assert not r.pexpireat('a', expire_at)
 
     @skip_if_server_version_lt('2.6.0')
     def test_pexpireat_unixtime(self, r):
-        expire_at = datetime.datetime.now() + datetime.timedelta(minutes=1)
+        expire_at = redis_server_time(r) + datetime.timedelta(minutes=1)
         r['a'] = 'foo'
         expire_at_seconds = int(time.mktime(expire_at.timetuple())) * 1000
         assert r.pexpireat('a', expire_at_seconds)
-        assert 0 < r.pttl('a') <= 60000
+        assert 0 < r.pttl('a') <= 61000
 
     @skip_if_server_version_lt('2.6.0')
     def test_psetex(self, r):
@@ -510,7 +583,7 @@ class TestRedisCommands(object):
         r.zadd('a', **{'1': 1})
         assert r.type('a') == b('zset')
 
-    #### LIST COMMANDS ####
+    # LIST COMMANDS
     def test_blpop(self, r):
         r.rpush('a', '1', '2')
         r.rpush('b', '3', '4')
@@ -635,7 +708,80 @@ class TestRedisCommands(object):
         assert r.rpushx('a', '4') == 4
         assert r.lrange('a', 0, -1) == [b('1'), b('2'), b('3'), b('4')]
 
-    ### SET COMMANDS ###
+    # SCAN COMMANDS
+    @skip_if_server_version_lt('2.8.0')
+    def test_scan(self, r):
+        r.set('a', 1)
+        r.set('b', 2)
+        r.set('c', 3)
+        cursor, keys = r.scan()
+        assert cursor == 0
+        assert set(keys) == set([b('a'), b('b'), b('c')])
+        _, keys = r.scan(match='a')
+        assert set(keys) == set([b('a')])
+
+    @skip_if_server_version_lt('2.8.0')
+    def test_scan_iter(self, r):
+        r.set('a', 1)
+        r.set('b', 2)
+        r.set('c', 3)
+        keys = list(r.scan_iter())
+        assert set(keys) == set([b('a'), b('b'), b('c')])
+        keys = list(r.scan_iter(match='a'))
+        assert set(keys) == set([b('a')])
+
+    @skip_if_server_version_lt('2.8.0')
+    def test_sscan(self, r):
+        r.sadd('a', 1, 2, 3)
+        cursor, members = r.sscan('a')
+        assert cursor == 0
+        assert set(members) == set([b('1'), b('2'), b('3')])
+        _, members = r.sscan('a', match=b('1'))
+        assert set(members) == set([b('1')])
+
+    @skip_if_server_version_lt('2.8.0')
+    def test_sscan_iter(self, r):
+        r.sadd('a', 1, 2, 3)
+        members = list(r.sscan_iter('a'))
+        assert set(members) == set([b('1'), b('2'), b('3')])
+        members = list(r.sscan_iter('a', match=b('1')))
+        assert set(members) == set([b('1')])
+
+    @skip_if_server_version_lt('2.8.0')
+    def test_hscan(self, r):
+        r.hmset('a', {'a': 1, 'b': 2, 'c': 3})
+        cursor, dic = r.hscan('a')
+        assert cursor == 0
+        assert dic == {b('a'): b('1'), b('b'): b('2'), b('c'): b('3')}
+        _, dic = r.hscan('a', match='a')
+        assert dic == {b('a'): b('1')}
+
+    @skip_if_server_version_lt('2.8.0')
+    def test_hscan_iter(self, r):
+        r.hmset('a', {'a': 1, 'b': 2, 'c': 3})
+        dic = dict(r.hscan_iter('a'))
+        assert dic == {b('a'): b('1'), b('b'): b('2'), b('c'): b('3')}
+        dic = dict(r.hscan_iter('a', match='a'))
+        assert dic == {b('a'): b('1')}
+
+    @skip_if_server_version_lt('2.8.0')
+    def test_zscan(self, r):
+        r.zadd('a', 'a', 1, 'b', 2, 'c', 3)
+        cursor, pairs = r.zscan('a')
+        assert cursor == 0
+        assert set(pairs) == set([(b('a'), 1), (b('b'), 2), (b('c'), 3)])
+        _, pairs = r.zscan('a', match='a')
+        assert set(pairs) == set([(b('a'), 1)])
+
+    @skip_if_server_version_lt('2.8.0')
+    def test_zscan_iter(self, r):
+        r.zadd('a', 'a', 1, 'b', 2, 'c', 3)
+        pairs = list(r.zscan_iter('a'))
+        assert set(pairs) == set([(b('a'), 1), (b('b'), 2), (b('c'), 3)])
+        pairs = list(r.zscan_iter('a', match='a'))
+        assert set(pairs) == set([(b('a'), 1)])
+
+    # SET COMMANDS
     def test_sadd(self, r):
         members = set([b('1'), b('2'), b('3')])
         r.sadd('a', *members)
@@ -728,7 +874,7 @@ class TestRedisCommands(object):
         assert r.sunionstore('c', 'a', 'b') == 3
         assert r.smembers('c') == set([b('1'), b('2'), b('3')])
 
-    ### SORTED SET COMMANDS ###
+    # SORTED SET COMMANDS
     def test_zadd(self, r):
         r.zadd('a', a1=1, a2=2, a3=3)
         assert r.zrange('a', 0, -1) == [b('a1'), b('a2'), b('a3')]
@@ -749,6 +895,12 @@ class TestRedisCommands(object):
         assert r.zincrby('a', 'a3', amount=5) == 8.0
         assert r.zscore('a', 'a2') == 3.0
         assert r.zscore('a', 'a3') == 8.0
+
+    @skip_if_server_version_lt('2.8.9')
+    def test_zlexcount(self, r):
+        r.zadd('a', a=0, b=0, c=0, d=0, e=0, f=0, g=0)
+        assert r.zlexcount('a', '-', '+') == 7
+        assert r.zlexcount('a', '[b', '[f') == 5
 
     def test_zinterstore_sum(self, r):
         r.zadd('a', a1=1, a2=1, a3=1)
@@ -797,6 +949,27 @@ class TestRedisCommands(object):
         assert r.zrange('a', 0, 1, withscores=True, score_cast_func=int) == \
             [(b('a1'), 1), (b('a2'), 2)]
 
+    @skip_if_server_version_lt('2.8.9')
+    def test_zrangebylex(self, r):
+        r.zadd('a', a=0, b=0, c=0, d=0, e=0, f=0, g=0)
+        assert r.zrangebylex('a', '-', '[c') == [b('a'), b('b'), b('c')]
+        assert r.zrangebylex('a', '-', '(c') == [b('a'), b('b')]
+        assert r.zrangebylex('a', '[aaa', '(g') == \
+            [b('b'), b('c'), b('d'), b('e'), b('f')]
+        assert r.zrangebylex('a', '[f', '+') == [b('f'), b('g')]
+        assert r.zrangebylex('a', '-', '+', start=3, num=2) == [b('d'), b('e')]
+
+    @skip_if_server_version_lt('2.9.9')
+    def test_zrevrangebylex(self, r):
+        r.zadd('a', a=0, b=0, c=0, d=0, e=0, f=0, g=0)
+        assert r.zrevrangebylex('a', '[c', '-') == [b('c'), b('b'), b('a')]
+        assert r.zrevrangebylex('a', '(c', '-') == [b('b'), b('a')]
+        assert r.zrevrangebylex('a', '(g', '[aaa') == \
+            [b('f'), b('e'), b('d'), b('c'), b('b')]
+        assert r.zrevrangebylex('a', '+', '[f') == [b('g'), b('f')]
+        assert r.zrevrangebylex('a', '+', '-', start=3, num=2) == \
+            [b('d'), b('c')]
+
     def test_zrangebyscore(self, r):
         r.zadd('a', a1=1, a2=2, a3=3, a4=4, a5=5)
         assert r.zrangebyscore('a', 2, 4) == [b('a2'), b('a3'), b('a4')]
@@ -831,6 +1004,16 @@ class TestRedisCommands(object):
         r.zadd('a', a1=1, a2=2, a3=3)
         assert r.zrem('a', 'a1', 'a2') == 2
         assert r.zrange('a', 0, 5) == [b('a3')]
+
+    @skip_if_server_version_lt('2.8.9')
+    def test_zremrangebylex(self, r):
+        r.zadd('a', a=0, b=0, c=0, d=0, e=0, f=0, g=0)
+        assert r.zremrangebylex('a', '-', '[c') == 3
+        assert r.zrange('a', 0, -1) == [b('d'), b('e'), b('f'), b('g')]
+        assert r.zremrangebylex('a', '[f', '+') == 2
+        assert r.zrange('a', 0, -1) == [b('d'), b('e')]
+        assert r.zremrangebylex('a', '[h', '+') == 0
+        assert r.zrange('a', 0, -1) == [b('d'), b('e')]
 
     def test_zremrangebyrank(self, r):
         r.zadd('a', a1=1, a2=2, a3=3, a4=4, a5=5)
@@ -921,7 +1104,38 @@ class TestRedisCommands(object):
         assert r.zrange('d', 0, -1, withscores=True) == \
             [(b('a2'), 5), (b('a4'), 12), (b('a3'), 20), (b('a1'), 23)]
 
-    ### HASH COMMANDS ###
+    # HYPERLOGLOG TESTS
+    @skip_if_server_version_lt('2.8.9')
+    def test_pfadd(self, r):
+        members = set([b('1'), b('2'), b('3')])
+        assert r.pfadd('a', *members) == 1
+        assert r.pfadd('a', *members) == 0
+        assert r.pfcount('a') == len(members)
+
+    @skip_if_server_version_lt('2.8.9')
+    def test_pfcount(self, r):
+        members = set([b('1'), b('2'), b('3')])
+        r.pfadd('a', *members)
+        assert r.pfcount('a') == len(members)
+        members_b = set([b('2'), b('3'), b('4')])
+        r.pfadd('b', *members_b)
+        assert r.pfcount('b') == len(members_b)
+        assert r.pfcount('a', 'b') == len(members_b.union(members))
+
+    @skip_if_server_version_lt('2.8.9')
+    def test_pfmerge(self, r):
+        mema = set([b('1'), b('2'), b('3')])
+        memb = set([b('2'), b('3'), b('4')])
+        memc = set([b('5'), b('6'), b('7')])
+        r.pfadd('a', *mema)
+        r.pfadd('b', *memb)
+        r.pfadd('c', *memc)
+        r.pfmerge('d', 'c', 'a')
+        assert r.pfcount('d') == 6
+        r.pfmerge('d', 'b')
+        assert r.pfcount('d') == 7
+
+    # HASH COMMANDS
     def test_hget_and_hset(self, r):
         r.hmset('a', {'1': 1, '2': 2, '3': 3})
         assert r.hget('a', '1') == b('1')
@@ -1001,7 +1215,7 @@ class TestRedisCommands(object):
         remote_vals = r.hvals('a')
         assert sorted(local_vals) == sorted(remote_vals)
 
-    ### SORT ###
+    # SORT
     def test_sort_basic(self, r):
         r.rpush('a', '3', '2', '1', '4')
         assert r.sort('a') == [b('1'), b('2'), b('3'), b('4')]
